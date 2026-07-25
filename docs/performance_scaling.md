@@ -240,6 +240,8 @@ flowchart TD
 
 - [Долговременная эволюция и замена Коры](./model_migration.md)
 - [Юридические, этические и UX-аспекты](./legal_ethical_ux.md)
+- [Миграция на Регулятор Пластичности — Архитектура](./pr_migration_architecture.md)
+- [Миграция на Регулятор Пластичности — План выполнения](./pr_migration_execution.md)
 
 ---
 
