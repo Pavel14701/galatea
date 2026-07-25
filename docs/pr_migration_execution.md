@@ -4,6 +4,11 @@
 
 Этот документ содержит **детальный план реализации** миграции на Регулятор Пластичности (PR), включая конкретные компоненты, форматы данных, временные характеристики, порядок действий на каждой фазе и критерии перехода. Он является продолжением [Архитектурного плана PR](./pr_migration_architecture.md).
 
+Все решения в этом документе учитывают:
+- **Динамический λ_max** — адаптивный верхний предел, зависящий от кортизола, орексина и лептина.
+- **Влияние окситоцина** — модуляция награды и добавление в состояние.
+- **Гиперпараметры PPO** — конкретные значения для стабильного обучения.
+
 ---
 
 ## Общая структура реализации
@@ -12,12 +17,12 @@
 
 Добавляются следующие модули в код Galatea:
 
-```text
+```
 galatea/
 ├── pr/
 │   ├── __init__.py
 │   ├── regulator.py          # Основной класс PR
-│   ├── state.py              # Формирование состояния
+│   ├── state.py              # Формирование состояния (включая окситоцин)
 │   ├── actor_critic.py       # Сети Actor и Critic (PyTorch)
 │   ├── replay_buffer.py      # Реплей-буфер (Redis + локальный кэш)
 │   ├── trainer.py            # PPO-обучение во время Сна
@@ -50,7 +55,6 @@ class PlasticityRegulator:
         self.optimizer_critic = torch.optim.Adam(self.critic.parameters(), lr=config.lr_critic)
         self.mode = "shadow"  # shadow | multiplier | full | personalized
         self.lambda_min = 0.1
-        self.lambda_max = 10.0  # динамический, но верхний предел
 
     def predict(self, state: State) -> Action:
         """Возвращает λ_pr (и параметры α, β для логирования)."""
@@ -58,13 +62,22 @@ class PlasticityRegulator:
             alpha, beta = self.actor(state.to_tensor())
         # Для инференса без исследования берём среднее
         lambda_raw = alpha / (alpha + beta)  # в [0, 1]
-        lambda_pr = self._scale_and_clamp(lambda_raw)
+        lambda_pr = self._scale_and_clamp(lambda_raw, state)
         return Action(alpha=alpha, beta=beta, lambda=lambda_pr)
 
-    def _scale_and_clamp(self, lambda_raw):
-        """Масштабирует из [0,1] в [λ_min, λ_max] с учётом динамического λ_max."""
-        lambda_scaled = lambda_raw * (self.lambda_max - self.lambda_min) + self.lambda_min
-        return np.clip(lambda_scaled, self.lambda_min, self.lambda_max)
+    def _scale_and_clamp(self, lambda_raw, state):
+        """Масштабирует из [0,1] в [λ_min, λ_max_dynamic]."""
+        lambda_max_dynamic = self._compute_dynamic_lambda_max(state)
+        lambda_scaled = lambda_raw * (lambda_max_dynamic - self.lambda_min) + self.lambda_min
+        return np.clip(lambda_scaled, self.lambda_min, lambda_max_dynamic)
+
+    def _compute_dynamic_lambda_max(self, state):
+        """Вычисляет адаптивный верхний предел."""
+        base = 6.0  # λ_max_base из статической формулы
+        cortisol = state.cortisol
+        orexin = state.prisms[6]   # индекс OP в 11 Призмах
+        leptin = state.prisms[9]   # индекс LP в 11 Призмах
+        return base * (1 + 0.5 * (1 - cortisol)) * (1 + 0.3 * orexin) * (1 - 0.2 * leptin)
 ```
 
 ### Шаг 1.2: Интеграция в онлайн-конвейер (теневой режим)
@@ -76,7 +89,7 @@ class PlasticityRegulator:
 lambda_static = compute_lambda_static(surprise, bond, threat, serotonin, orexin, oxytocin)
 
 # Теневой вызов PR
-pr_state = StateAggregator.get_state(prisms, user_id)
+pr_state = StateAggregator.get_state(prisms, user_id)  # включает окситоцин
 pr_action = pr.predict(pr_state)
 lambda_pr = pr_action.lambda
 
@@ -92,6 +105,7 @@ logger.log(
     bond=bond_score,
     threat=threat_score,
     surprise=surprise_score,
+    oxytocin=oxytocin_level,
     # ... другие метрики
 )
 
@@ -110,12 +124,15 @@ class StateAggregator:
         # 11 значений Призм (нормализованы)
         p = prisms.to_array()  # shape (11,)
 
-        # Скользящие средние за последние 5 шагов (хранятся в Redis или в памяти сессии)
-        moving_avg = cls._get_moving_average(p, window=cls.WINDOW)
+        # Скользящие средние за последние 5 шагов (хранятся в Redis)
+        moving_avg = cls._get_moving_average(p, window=cls.WINDOW, user_id=user_id)
 
-        # Кортизол и серотонин из медленных Призм (уже есть в p, но выделяем отдельно)
+        # Кортизол и серотонин из медленных Призм
         cortisol = p[8]   # индекс CP
         serotonin = p[7]  # индекс SPe
+
+        # Окситоцин из профиля пользователя
+        oxytocin = cls._get_oxytocin(user_id)  # 0..1
 
         # User embedding (пусто на Фазе 1, будет добавлен позже)
         user_embedding = None
@@ -125,29 +142,37 @@ class StateAggregator:
             moving_avg=moving_avg,         # (11,)
             cortisol=cortisol,
             serotonin=serotonin,
+            oxytocin=oxytocin,
             user_embedding=user_embedding  # None
         )
         return state
 
     @classmethod
-    def _get_moving_average(cls, current, window):
+    def _get_moving_average(cls, current, window, user_id):
         # Хранит историю в Redis: key = "prisms_history:{user_id}" → list of arrays
-        history = redis.lrange(f"prisms_history:{user_id}", -window, -1)
+        key = f"prisms_history:{user_id}"
+        history = redis.lrange(key, -window, -1)
         if len(history) < window:
-            history.append(current)  # дополняем текущим
+            history.append(current)
         else:
             history.pop(0)
             history.append(current)
-        redis.rpush(f"prisms_history:{user_id}", current)  # сохраняем
+        redis.rpush(key, current)
         avg = np.mean(history, axis=0)
         return avg
+
+    @classmethod
+    def _get_oxytocin(cls, user_id):
+        # Из профиля пользователя в Redis
+        profile = redis.get(f"user:{user_id}")
+        return profile.get("oxytocin_level", 0.0)
 ```
 
 ### Шаг 1.4: Формат логирования (база данных)
 
 Логи пишутся в Redis (для быстрого доступа) и в S3 (для долгосрочного хранения) в формате Parquet.
 
-Структура записи:
+Структура записи (обновлена с учётом окситоцина):
 
 ```python
 {
@@ -159,6 +184,7 @@ class StateAggregator:
         "moving_avg": [0.19, 0.79, 0.11, ...],
         "cortisol": 0.3,
         "serotonin": 0.7,
+        "oxytocin": 0.6,
         "user_embedding": None
     },
     "action": {
@@ -171,7 +197,8 @@ class StateAggregator:
     "bond_score": 0.75,
     "threat_score": 0.12,
     "surprise_score": 0.55,
-    "session_id": "uuid"
+    "session_id": "uuid",
+    "lambda_max_dynamic": 5.2  # для мониторинга
 }
 ```
 
@@ -189,7 +216,6 @@ class BehavioralCloningTrainer:
         y = df['lambda_static'].values  # (n_samples,)
 
         # Обучаем Actor (модель, которая предсказывает λ)
-        # Здесь мы обучаем только Actor, Critic не нужен
         dataset = TensorDataset(torch.tensor(X, dtype=torch.float32),
                                 torch.tensor(y, dtype=torch.float32))
         dataloader = DataLoader(dataset, batch_size=256, shuffle=True)
@@ -223,6 +249,8 @@ class BehavioralCloningTrainer:
 - Корреляция `lambda_pr` с `bond_score` и `threat_score`
 - MSE обучения BC (с течением времени)
 - Количество шагов, залогированных в Shadow Mode (прогресс накопления данных)
+- Среднее `λ_max_dynamic` и его распределение
+- Корреляция окситоцина с λ_pr (для проверки чувствительности)
 
 **Критерий готовности к Фазе 2:** Накоплено ≥ 100 000 шагов (или ≥ 1000 полных сессий) и MSE < 0.01.
 
@@ -240,24 +268,33 @@ class BehavioralCloningTrainer:
 
 ```python
 # В онлайн-конвейере:
+pr_state = StateAggregator.get_state(prisms, user_id)
 lambda_pr = pr.predict(pr_state).lambda
 lambda_pr_clamped = np.clip(lambda_pr, 0.5, 2.0)  # жёсткий множитель
 lambda_final = lambda_static * lambda_pr_clamped
+
+# Применяем динамический clamp (учёт λ_max_dynamic)
+lambda_max_dynamic = pr._compute_dynamic_lambda_max(pr_state)
 lambda_final = np.clip(lambda_final, 0.1, lambda_max_dynamic)
 ```
 
-### Шаг 2.2: Вычисление награды (instant reward)
+### Шаг 2.2: Вычисление награды (instant reward) с учётом окситоцина
 
 После отправки ответа (но до следующего шага) вычисляется награда:
 
 ```python
-def compute_instant_reward(bond_score, threat_score, lambda_t, lambda_prev):
+def compute_instant_reward(bond_score, threat_score, lambda_t, lambda_prev, oxytocin):
     alpha = 1.0
     beta = 2.0
     gamma = 0.5
-    return alpha * bond_score - beta * threat_score - gamma * abs(lambda_t - lambda_prev)
+    # Модуляция окситоцином
+    bond_bonus = 1 + 0.2 * oxytocin
+    change_penalty = 1 - 0.3 * oxytocin
+    return (alpha * bond_score * bond_bonus -
+            beta * threat_score -
+            gamma * abs(lambda_t - lambda_prev) * change_penalty)
 
-reward_instant = compute_instant_reward(bond_score, threat_score, lambda_final, lambda_prev)
+reward_instant = compute_instant_reward(bond_score, threat_score, lambda_final, lambda_prev, oxytocin)
 ```
 
 ### Шаг 2.3: Финальная награда (после сессии)
@@ -288,7 +325,7 @@ def compute_session_reward(retention, session_duration, avg_bond, threat_events)
 ```python
 # В конвейере после каждого шага добавляем в буфер
 replay_buffer.add(
-    state=state,
+    state=state,  # включает окситоцин
     action=action,  # содержит alpha, beta, lambda
     reward=reward_instant,
     next_state=next_state,
@@ -314,6 +351,10 @@ def should_fallback_to_static(pr_state, threat_events_in_session, cortisol):
     # Проверка на аномалии (NaN, inf)
     if not np.isfinite(pr_state.to_array()).all():
         return True
+    # Проверка, не вышел ли λ_pr за пределы динамического диапазона
+    lambda_max_dynamic = pr._compute_dynamic_lambda_max(pr_state)
+    if pr_action.lambda > lambda_max_dynamic * 1.5:  # слишком далеко за потолок
+        return True
     return False
 
 # В конвейере:
@@ -332,11 +373,12 @@ if should_fallback_to_static(pr_state, threat_events, cortisol):
   - Длительность сессии (среднее).
   - Количество threat-событий на сессию.
   - Удовлетворённость (если есть явная обратная связь).
+  - Распределение λ_t в группе А (среднее, дисперсия).
 - **Критерий успеха:** Статистически значимое (p < 0.05) улучшение retention в группе А, при отсутствии ухудшения по другим метрикам.
 
-### Шаг 2.7: Периодическое дообучение PR (PPO)
+### Шаг 2.7: Периодическое дообучение PR (PPO) — пока не запускаем
 
-На этом этапе мы уже можем начать дообучать PR с PPO, но только на данных из группы А (тех, кто уже использует PR). Однако, чтобы не усложнять, мы можем отложить PPO до Фазы 3. В Фазе 2 мы просто собираем данные.
+На этом этапе мы пока откладываем PPO, чтобы избежать влияния обучения на результаты A/B-теста.
 
 ---
 
@@ -352,8 +394,10 @@ if should_fallback_to_static(pr_state, threat_events, cortisol):
 
 ```python
 # В конвейере:
-lambda_final = pr.predict(pr_state).lambda
-lambda_final = np.clip(lambda_final, 0.1, lambda_max_dynamic)  # только clamp
+pr_state = StateAggregator.get_state(prisms, user_id)  # включает окситоцин
+lambda_pr = pr.predict(pr_state).lambda
+lambda_max_dynamic = pr._compute_dynamic_lambda_max(pr_state)
+lambda_final = np.clip(lambda_pr, 0.1, lambda_max_dynamic)  # только динамический clamp
 ```
 
 ### Шаг 3.2: Реплей-буфер для обучения PPO
@@ -381,7 +425,31 @@ class ReplayBuffer:
 
 ### Шаг 3.3: Обучение PR с PPO (во время Сна)
 
-В цикле Сна запускается задача обучения PR.
+В цикле Сна запускается задача обучения PR с гиперпараметрами, описанными ниже.
+
+#### Гиперпараметры PPO
+
+Для стабильного обучения используются следующие значения:
+
+| Параметр | Значение | Обоснование |
+|:---------|:--------:|:------------|
+| **Learning rate (Actor)** | `3e-4` | Стандартное значение для Adam в PPO, обеспечивает плавное обновление. |
+| **Learning rate (Critic)** | `1e-3` | Critic может учиться быстрее, так как его задача — аппроксимировать ценность состояния. |
+| **Batch size** | `256` | Достаточно для стабильного градиента, не перегружает память. |
+| **PPO epochs** | `10` | Количество проходов по одному батчу данных; 10 даёт хорошее качество без переобучения. |
+| **Clip epsilon** | `0.2` | Классическое значение для PPO, ограничивает изменение политики. |
+| **Discount factor (γ)** | `0.99` | Стандартное дисконтирование для долгосрочных задач. |
+| **GAE lambda** | `0.95` | Баланс между bias и variance в оценке преимущества. |
+| **Gradient clipping** | `0.5` | Предотвращает взрыв градиентов. |
+| **L2-регуляризация** | `1e-5` | Слабая регуляризация весов Actor и Critic. |
+| **Entropy coefficient** | `0.01` | Поощряет исследование, добавляя энтропию в политику. |
+| **Max gradient norm** | `0.5` | Ограничение нормы градиента для стабильности. |
+
+**Схема обновления:** во время Сна выполняется `epochs * num_batches` обновлений. Если данных недостаточно, эпохи пропускаются.
+
+**Периодичность сохранения чекпоинтов:** каждый день после обучения сохраняется чекпоинт (веса Actor и Critic), а также мета-информация (версия, дата, количество шагов обучения). Хранятся последние 7 чекпоинтов для возможности отката.
+
+#### Код PPO_Trainer
 
 ```python
 class PPO_Trainer:
@@ -415,9 +483,7 @@ class PPO_Trainer:
 
     def _update_actor(self, batch):
         states, actions, advantages = batch
-        # Вычисляем логарифм вероятности (log_prob) для старой политики
         old_log_prob = self.actor.get_log_prob(states, actions).detach()
-        # Новая политика
         new_log_prob = self.actor.get_log_prob(states, actions)
         ratio = torch.exp(new_log_prob - old_log_prob)
         clipped_ratio = torch.clamp(ratio, 1-self.clip_epsilon, 1+self.clip_epsilon)
@@ -448,9 +514,10 @@ def nightly_validation(new_weights_path, validation_data):
 Еженедельный отчёт содержит:
 
 - Среднее `λ_t` за неделю и его распределение.
-- Корреляция `λ_t` с bond/threat.
+- Корреляция `λ_t` с bond/threat/окситоцином.
 - Количество fallback-событий (должно быть < 1%).
 - Дивергенция политики (разница в параметрах между соседними обновлениями).
+- Среднее `λ_max_dynamic` и его корреляция с кортизолом/орексином/лептином.
 
 **Критерий стабилизации:** Дивергенция < 0.01 в течение 4 недель.
 
@@ -470,17 +537,18 @@ def nightly_validation(new_weights_path, validation_data):
 
 ```python
 class State:
-    def __init__(self, prisms, moving_avg, cortisol, serotonin, user_embedding):
+    def __init__(self, prisms, moving_avg, cortisol, serotonin, oxytocin, user_embedding):
         self.prisms = prisms
         self.moving_avg = moving_avg
         self.cortisol = cortisol
         self.serotonin = serotonin
+        self.oxytocin = oxytocin
         self.user_embedding = user_embedding  # shape (embed_dim,)
 
     def to_tensor(self):
         # Конкатенация всех компонентов
         vec = np.concatenate([self.prisms, self.moving_avg,
-                             [self.cortisol, self.serotonin],
+                             [self.cortisol, self.serotonin, self.oxytocin],
                              self.user_embedding])
         return torch.tensor(vec, dtype=torch.float32)
 ```
@@ -505,7 +573,8 @@ User embedding может быть:
 | Компонент | Задержка | Пропускная способность |
 |:----------|:--------:|:----------------------:|
 | Инференс PR (Actor) | < 5 мс | > 1000 запросов/сек |
-| Формирование состояния | < 1 мс | > 5000 запросов/сек |
+| Формирование состояния (включая окситоцин) | < 2 мс | > 5000 запросов/сек |
+| Вычисление λ_max_dynamic | < 0.5 мс | > 5000 запросов/сек |
 | Вычисление награды | < 1 мс | > 5000 запросов/сек |
 | Логирование (Redis) | < 2 мс | > 2000 запросов/сек |
 | Обучение PPO (во время Сна) | — | 1–2 часа на 100 000 шагов |
@@ -516,7 +585,7 @@ User embedding может быть:
 
 ## Форматы данных (подробно)
 
-### State (состояние)
+### State (состояние) — обновлено с окситоцином
 
 ```python
 State = {
@@ -524,11 +593,12 @@ State = {
     "moving_avg": [float] * 11,   # скользящее среднее за 5 шагов
     "cortisol": float,            # 0..1
     "serotonin": float,           # 0..1
+    "oxytocin": float,            # 0..1 (из профиля пользователя)
     "user_embedding": [float] * 64,  # опционально, только на Фазах 4+
 }
 ```
 
-### Action (действие)
+### Action (действие) — без изменений
 
 ```python
 Action = {
@@ -538,17 +608,17 @@ Action = {
 }
 ```
 
-### Reward (награда)
+### Reward (награда) — обновлено с учётом окситоцина
 
 ```python
 Reward = {
-    "instant": float,             # шаговая награда
+    "instant": float,             # шаговая награда (с модуляцией окситоцином)
     "session_bonus": float,       # добавляется после сессии (discounted)
     "final": float,               # итоговая с учётом дисконтирования (для Critic)
 }
 ```
 
-### Trajectory (траектория)
+### Trajectory (траектория) — обновлена
 
 ```python
 Trajectory = {
@@ -559,6 +629,7 @@ Trajectory = {
     "session_reward": float,      # итоговая награда сессии (без дисконтирования)
     "timestamp": datetime,
     "version": str,               # "shadow", "multiplier", "full"
+    "avg_oxytocin": float,        # средний окситоцин в сессии (для анализа)
 }
 ```
 
@@ -574,6 +645,8 @@ Trajectory = {
 | Retention (группа с PR) | Предупреждение | Падение > 5% за неделю |
 | Threat-события | Критический | Рост > 20% за неделю |
 | Время инференса PR | Предупреждение | > 10 мс |
+| Средний окситоцин в группе с PR | Информационный | Следить за трендом |
+| λ_max_dynamic среднее | Информационный | Контроль диапазона |
 
 ---
 
@@ -581,9 +654,9 @@ Trajectory = {
 
 | Версия | Этап | Действия |
 |:-------|:-----|:---------|
-| v4.5 | Фаза 1 (Shadow) | Реализация PR, сбор данных, BC обучение |
+| v4.5 | Фаза 1 (Shadow) | Реализация PR с учётом окситоцина и λ_max_dynamic; сбор данных; BC обучение |
 | v5.0 | Фаза 2 (Multiplier) | A/B-тест, guardrails, накопление траекторий |
-| v5.5 | Фаза 3 (Full) | Полная замена, PPO, реплей-буфер, откат |
+| v5.5 | Фаза 3 (Full) | Полная замена, PPO с гиперпараметрами, реплей-буфер, откат |
 | v6.0 | Фаза 4 (Personalization) | User embedding, кластеризация, персонализация |
 
 ---
