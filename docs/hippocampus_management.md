@@ -128,11 +128,11 @@ weight: 2
 
 ```mermaid
 flowchart TD
-    User[("Пользователь (user_id)")] --> Load[1. Загрузка профиля\nbond_state, bond_score,\noxytocin_level, learning_enabled\nactive_adapters (до 5)]
-    Load --> Select[2. Выбор активного адаптера\n• cos_sim(embed_request, avg_source)\n• max_sim > 0.6 → активировать\n• иначе → protection_score\n• гистерезис: 2 шага]
-    Select --> Generate[3. Генерация ответа\nКора + consolidation LoRA\n+ выбранные адаптеры → y_t]
-    Generate --> Learn[4. Онлайн-обучение\nW += α_base * λ_t * gradient\nreserve_copy / pending_copy\nоткат при threat > 0.9\ncurriculum learning\nreplay-буфер]
-    Learn --> Sync[5. Синхронизация\nЭтап 1: SQLite + threading.Lock\nЭтап 2+: Redis + Redlock + Lua\nLRU-кэш в GPU]
+    User[("Пользователь (user_id)")] --> Load["1. Загрузка профиля<br/>bond_state, bond_score,<br/>oxytocin_level, learning_enabled<br/>active_adapters (до 5)"]
+    Load --> Select["2. Выбор активного адаптера<br/>• cos_sim(embed_request, avg_source)<br/>• max_sim > 0.6 → активировать<br/>• иначе → protection_score<br/>• гистерезис: 2 шага"]
+    Select --> Generate["3. Генерация ответа<br/>Кора + consolidation LoRA<br/>+ выбранные адаптеры → y_t"]
+    Generate --> Learn["4. Онлайн-обучение<br/>W += α_base * λ_t * gradient<br/>reserve_copy / pending_copy<br/>откат при threat > 0.9<br/>curriculum learning<br/>replay-буфер"]
+    Learn --> Sync["5. Синхронизация<br/>Этап 1: SQLite + threading.Lock<br/>Этап 2+: Redis + Redlock + Lua<br/>LRU-кэш в GPU"]
 ```
 
 ## Связи с другими компонентами
