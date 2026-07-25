@@ -51,6 +51,92 @@ weight: 1
 
 Как только средний `surprise_score` возвращается к **0.4** — безопасному уровню, свидетельствующему о восстановлении нормальной пластичности, — оба механизма отключаются. Это гарантирует, что исследовательская активность и штрафы являются временной мерой, а не перманентным источником шума в системе.
 
+### Схема
+
+```mermaid
+flowchart TD
+    subgraph Inputs["Входные данные для SP"]
+        Request["Текущий запрос пользователя (embed_current)"]
+        History["Последние 5 запросов (avg_embed_last_5)"]
+        Previous["Предыдущий запрос (e_prev)"]
+        Timestamp["Временная метка шага t"]
+    end
+
+    subgraph TimeCheck["Проверка таймстемпа"]
+        TimeCheckNode{Пауза > 5 минут?}
+        TimeSet["surprise_score = 0.5<br/>(нейтральное значение)"]
+    end
+
+    subgraph MVP["MVP-реализация (до Этапа 2)"]
+        AvgEmbed["avg_embed_last_5 =<br/>усреднённый эмбеддинг<br/>последних 5 запросов"]
+        CosSim["cosine_similarity(embed_current, avg_embed_last_5)"]
+        MVPCalc["surprise_score = 1 - cos_sim"]
+    end
+
+    subgraph Full["Полная реализация (Этап 2+)"]
+        Context["Контекстное окно:<br/>3 предыдущих запроса"]
+        EarlyLayers["Ранние слои Коры<br/>(после 4-го блока)"]
+        F_Pred["f_pred (MLP: 256 → embed_dim)"]
+        PredEmbed["e_pred = f_pred(...)"]
+        CosFull["cosine_similarity(e_pred, e_actual)"]
+        FullCalc["surprise_score = σ((1 - cos) / τ), τ = 0.1"]
+    end
+
+    subgraph Filters["Фильтры"]
+        TopicFilter{Смена темы?<br/>cosine_distance(e_actual, e_prev) > 0.7}
+        TopicApply["surprise_score × 0.3"]
+    end
+
+    subgraph Output["Выход"]
+        Final["Финальный surprise_score ∈ [0,1]"]
+    end
+
+    subgraph Training["Обучение f_pred (Этап 2+)"]
+        EActual["e_actual_{t+1}<br/>(реальный эмбеддинг следующего запроса)"]
+        MSE["MSE(e_pred_t, e_actual_{t+1})"]
+        Lambda["λ_t (коэффициент пластичности)"]
+        Update["lr_pred = α_base × 0.1<br/>W += lr_pred × λ_t × gradient"]
+    end
+
+    subgraph Protection["Защита от самоусиливающейся предсказуемости"]
+        Monitor["Мониторинг:<br/>средний surprise_score<br/>за последние 200 шагов"]
+        CheckLow{средний surprise < 0.3?}
+        Epsilon["ε-жадное исследование:<br/>2% шанс → surprise = 0.8"]
+        Variance["Штраф за низкую дисперсию:<br/>L_total = MSE + λ_var × max(0, 0.1 - σ²(e_pred))"]
+        Restore{средний surprise > 0.4?}
+        Disable["Отключить механизмы"]
+    end
+
+    Inputs --> TimeCheck
+    TimeCheckNode -->|Да| TimeSet
+    TimeCheckNode -->|Нет| MVP
+    TimeCheckNode -->|Нет| Full
+
+    History --> MVP
+    Request --> CosSim
+    AvgEmbed --> CosSim
+    CosSim --> MVPCalc
+
+    Context --> F_Pred
+    EarlyLayers --> F_Pred
+    Request --> F_Pred
+    F_Pred --> PredEmbed
+    PredEmbed --> CosFull
+    CosFull --> FullCalc
+
+    MVPCalc --> TopicFilter
+    FullCalc --> TopicFilter
+    TopicFilter -->|Да| TopicApply
+    TopicFilter -->|Нет| Final
+    TopicApply --> Final
+    TimeSet --> Final
+
+    F_Pred --> Training
+    PredEmbed --> MSE
+    EActual --> MSE
+    Lambda --> Update
+```
+
 ---
 
 ## 2. Призма Близости (Bond Prism, BP)
@@ -159,6 +245,118 @@ BP обучается онлайн на трёх целевых сигналах
 *Версионирование.* Каждое обновление `bond_state` увеличивает счётчик версии (`version`). При записи реплика проверяет, что версия в Redis совпадает с той, которую она прочитала. Если другая реплика уже обновила состояние, текущая операция отклоняется, и реплика перечитывает актуальное состояние и повторяет расчёт. Это оптимистичная блокировка, которая не требует тяжёлых локаутов.
 *WATCH/MULTI/EXEC.* Это нативный механизм Redis для атомарных транзакций. `WATCH` отслеживает ключ на предмет изменений, `MULTI` начинает транзакцию, а `EXEC` выполняет её атомарно. Если ключ был изменён другой репликой между `WATCH` и `EXEC`, транзакция отменяется. Это гарантирует консистентность `bond_state` даже при одновременных запросах от одного пользователя к разным репликам Коры.
 *Зачем такие сложности?* `bond_state` — это не просто значение, а накопитель истории. Если две реплики обновят его параллельно, одна из них перезапишет результат другой, и часть истории будет потеряна. Версионирование и атомарные транзакции предотвращают это без снижения пропускной способности (в отличие от глобальных блокировок).
+
+### Схема
+
+```mermaid
+flowchart TD
+    subgraph Inputs["Входные данные"]
+        EUser["Эмбеддинг запроса пользователя (e_user)"]
+        EResponse["Эмбеддинг ответа Galatea (e_response)"]
+        Timestamp["Временная метка"]
+        LastActive["last_active (время последнего взаимодействия)"]
+    end
+
+    subgraph Architecture["Архитектура BP"]
+        GRU["GRU (скрытое состояние 128)"]
+        MLP["MLP (128 → 64 → 1)"]
+        Sigmoid["Сигмоида (σ)"]
+        State["s_t = GRU(s_{t-1}, [e_user; e_response; timestamp])"]
+        BondScore["bond_score = σ(MLP(s_t))"]
+    end
+
+    subgraph Dynamics["Динамика состояния"]
+        subgraph Decay["Временное затухание"]
+            CheckDecay{last_active > 1 час?}
+            DecayApply["s_t × 0.9"]
+        end
+
+        subgraph ColdStart["Холодный старт"]
+            Init["Новый пользователь: bond_score = 0.2"]
+            Accelerate{"Первые 20 шагов?<br/>surprise > 0.6?<br/>threat < 0.4?<br/>Нет повторов?"}
+            AccelerateApply["Коэффициент роста × 1.5"]
+        end
+    end
+
+    subgraph Protections["Защита от манипуляций"]
+        subgraph Skepticism["Режим скепсиса"]
+            CheckSkeptic{Взлёт bond_score > 0.5 за сессию?}
+            SkepticAction["bond_score × 0.5<br/>threat_boost +0.2 (10 шагов)<br/>Защита адаптера отложена"]
+        end
+
+        subgraph Repeats["Детектор повторов"]
+            CheckRepeat{cos_sim(s_t, s_{t-20}) > 0.95<br/>3 раза подряд?}
+            RepeatAction["bond_score × 0.7 (занижение на 30%)"]
+        end
+
+        subgraph Diversity["Учёт разнообразия"]
+            CheckDiversity{Низкая дисперсия surprise_score?}
+            DiversityAction["Замедление роста bond_score"]
+        end
+    end
+
+    subgraph Reconciliation["Фаза примирения"]
+        CheckFall{Падение bond_score ≥ 0.3<br/>из-за угрозы?}
+        CheckSeries{Серия шагов:<br/>threat < 0.3?<br/>surprise > 0.5?}
+        Boost["Буст +0.05 за шаг<br/>(до уровня до падения)"]
+    end
+
+    subgraph Storage["Хранение состояния"]
+        subgraph Stage1["Этап 1 (MVP)"]
+            SQLite["SQLite (сериализация в BLOB)"]
+            Lock["threading.Lock"]
+        end
+
+        subgraph Stage2["Этап 2+ (Продакшен)"]
+            Redis["Redis Cluster<br/>user:{user_id} → bond_state"]
+            Version["Версионирование"]
+            Watch["WATCH/MULTI/EXEC"]
+        end
+    end
+
+    subgraph Output["Выход"]
+        Final["Финальный bond_score ∈ [0,1]"]
+        StateUpdate["Обновление s_t в профиле"]
+    end
+
+    subgraph Training["Обучение BP"]
+        Targets["Три целевых сигнала:<br/>1. Предсказание возврата пользователя<br/>2. Контрастное обучение<br/>3. Мягкий сигнал от других Призм"]
+        LR["lr_bp = 1e-5 (очень малый)"]
+        Batch["Микробатчи из 8 шагов"]
+    end
+
+    Inputs --> Architecture
+    State --> Dynamics
+    Decay --> State
+    ColdStart --> BondScore
+    BondScore --> Protections
+    Protections --> Reconciliation
+    Reconciliation --> Storage
+    Storage --> Output
+
+    Decay --> StateUpdate
+    ColdStart --> StateUpdate
+    Protections --> StateUpdate
+    Reconciliation --> StateUpdate
+
+    State --> Training
+    Training --> Targets
+    Training --> LR
+    Training --> Batch
+
+    subgraph Explanations["Пояснения"]
+        GRUExplain["GRU (128): Рекуррентная модель, аккумулирующая историю отношений"]
+        MLPExplain["MLP: Нелинейное отображение состояния в оценку близости"]
+        DecayExplain["Временное затухание: 0.9 при паузе > 1ч — мягкое остывание"]
+        ColdExplain["Холодный старт: 0.2 + ускорение (×1.5) при благоприятных условиях"]
+        SkepticExplain["Режим скепсиса: защита от быстрых атак на bond_score"]
+        RepeatExplain["Детектор повторов: штраф за механическое повторение"]
+        DiversityExplain["Учёт разнообразия: замедление роста при однообразном диалоге"]
+        ReconciliationExplain["Фаза примирения: восстановление после конфликта (+0.05/шаг)"]
+        Stage1Explain["Этап 1: локальное хранение, блокировка threading.Lock"]
+        Stage2Explain["Этап 2+: Redis с версионированием и атомарными транзакциями"]
+    end
+```
 
 ---
 
@@ -300,6 +498,166 @@ surprise_effective = surprise_score * orexin_factor
 ### Нормировка
 
 Если на шаге обновляются несколько адаптеров (например, персональный и общие), `λ_t` делится на их количество. Это предотвращает чрезмерное суммарное изменение: если бы каждый адаптер получил полный `λ_t`, обучение было бы в N раз сильнее, чем предполагается формулой.
+
+### Схема
+
+```mermaid
+flowchart TD
+    subgraph Inputs["Входные данные для TP"]
+        H_t["Энтропия логитов H_t"]
+        Trend["Тренд энтропии за 20 шагов"]
+        HEarly["Скрытое состояние ранних слоёв Коры (h_early)"]
+        EUser["Эмбеддинг запроса (e_user)"]
+        EResponse["Эмбеддинг ответа (e_response)"]
+        ThreatBoost["threat_boost (период охлаждения)"]
+    end
+
+    subgraph FastMode["Быстрая оценка (каждый шаг)"]
+        MLP_Fast["MLP_threat_fast"]
+        ThreatBase["threat_base = σ(MLP(…))"]
+    end
+
+    subgraph FullMode["Полная оценка (события-кандидаты)"]
+        ConditionFull{"surprise × bond > 0.5?"}
+        TempCopy["Создать временную копию адаптера"]
+        TestUpdate["Применить пробное обновление"]
+        HBefore["H_before (энтропия до)"]
+        HAfter["H_after (энтропия после)"]
+        DeltaH["ΔH = (H_after - H_before) / H_before"]
+        MLP_Full["MLP_threat_full"]
+        ThreatFull["threat_score с учётом ΔH"]
+    end
+
+    subgraph Ethics["Интеграция с Этическим классификатором"]
+        DeBERTa["DeBERTa INT8 (асинхронный)"]
+        CheckEthics{"violation_score > 0.7?"}
+        EthicsAction["threat_score = 0.9 (принудительно)<br/>bond_score – 0.3<br/>threat_boost +0.15 (5 минут)"]
+    end
+
+    subgraph DoubleBuffer["Двойной буфер для отката"]
+        Reserve["reserve_copy (состояние до обновления)"]
+        Pending["pending_copy (состояние после обновления)"]
+        CheckPending{"pending_copy был обновлён?"}
+        Rollback["Откат к reserve_copy"]
+        Apply["Применить pending_copy"]
+    end
+
+    subgraph Thresholds["Пороги"]
+        ThreatScore{"threat_score"}
+        Block["> 0.9 → Полная блокировка, откат"]
+        Reduce["0.7 – 0.9 → Сильное занижение λ_t"]
+        Normal["≤ 0.7 → Норма"]
+    end
+
+    subgraph DriftProtection["Защита от медленного дрейфа"]
+        TopicSwitch{"Смена темы?<br/>cosine_distance > 0.7"}
+        ResetTrend["Сброс тренда энтропии"]
+        JS_Divergence["Кумулятивный детектор JS-дивергенции"]
+        CheckDrift{"JS-дивергенция > порога<br/>2 недели подряд?"}
+        ForcedSleep["Принудительный Сон<br/>+ консолидация из золотого стандарта"]
+    end
+
+    subgraph Failover["Защита от сбоев"]
+        CheckNaN{"NaN или таймаут?"}
+        Fallback["threat_score = 0.1 (безопасный минимум)"]
+    end
+
+    subgraph Aggregation["Агрегация λ_t"]
+        Surprise["surprise_score"]
+        Bond["bond_score"]
+        Threat["threat_score"]
+        Serotonin["serotonin"]
+        Orexin["orexin"]
+        Oxytocin["oxytocin"]
+        Adrenaline["Проверка AP"]
+        Epsilon["ε = 0.01"]
+
+        OrexinFactor["orexin_factor = 1.0 + 0.3×(orexin - 0.5)"]
+        SurpriseEff["surprise_eff = surprise × orexin_factor"]
+        LambdaBase["λ_max_base = 4.0 + 2.0×serotonin"]
+        OxytocinThreat["threat_eff = threat - 0.05×oxytocin"]
+        Lambda["λ_t = min((surprise_eff × bond) / (threat_eff + ε), λ_max_base)"]
+        APCheck{"surprise > порог?<br/>bond > порог?<br/>threat < 0.5?<br/>лимиты не превышены?"}
+        LambdaAP["λ_t = min((surprise_eff × bond) / (threat_eff + ε) × 2.0, 10.0)"]
+        Normalize["Нормировка: деление на число активных адаптеров"]
+    end
+
+    subgraph Output["Выход"]
+        Final["Финальный λ_t → Гиппокамп (онлайн-обучение)"]
+    end
+
+    Inputs --> FastMode
+    FastMode --> ThreatBase
+
+    ConditionFull -->|Да| TempCopy
+    TempCopy --> TestUpdate
+    TestUpdate --> HBefore
+    TestUpdate --> HAfter
+    HBefore --> DeltaH
+    HAfter --> DeltaH
+    DeltaH --> MLP_Full
+    MLP_Full --> ThreatFull
+
+    ThreatBase --> Ethics
+    ThreatFull --> Ethics
+
+    DeBERTa --> CheckEthics
+    CheckEthics -->|Да| EthicsAction
+    EthicsAction --> DoubleBuffer
+
+    DoubleBuffer --> CheckPending
+    CheckPending -->|Да| Rollback
+    CheckPending -->|Нет| Apply
+
+    EthicsAction --> Thresholds
+    ThreatBase --> Thresholds
+    ThreatFull --> Thresholds
+    Thresholds --> Block
+    Thresholds --> Reduce
+    Thresholds --> Normal
+
+    ThreatBase --> DriftProtection
+    TopicSwitch -->|Да| ResetTrend
+    ResetTrend --> FastMode
+    JS_Divergence --> CheckDrift
+    CheckDrift -->|Да| ForcedSleep
+
+    ThreatBase --> Failover
+    CheckNaN -->|Да| Fallback
+
+    ThreatBase --> Aggregation
+    ThreatFull --> Aggregation
+    Fallback --> Aggregation
+
+    Surprise --> Lambda
+    Bond --> Lambda
+    Threat --> Lambda
+    Serotonin --> LambdaBase
+    Orexin --> OrexinFactor
+    OrexinFactor --> SurpriseEff
+    SurpriseEff --> Lambda
+    Oxytocin --> OxytocinThreat
+    OxytocinThreat --> Lambda
+    LambdaBase --> Lambda
+
+    Lambda --> APCheck
+    APCheck -->|Да| LambdaAP
+    APCheck -->|Нет| Lambda
+    LambdaAP --> Normalize
+    Lambda --> Normalize
+    Normalize --> Final
+
+    subgraph Explanations["Пояснения"]
+        FastExplain["Быстрая оценка: MLP на каждом шагу<br/>— энтропия, тренд, h_early, эмбеддинги"]
+        FullExplain["Полная оценка: только при surprise×bond > 0.5<br/>— пробное обновление + ΔH"]
+        EthicsExplain["Этический классификатор: внешний детектор вредного контента<br/>— при violation > 0.7 → threat = 0.9"]
+        BufferExplain["Двойной буфер: reserve_copy и pending_copy<br/>— откат при обнаружении угрозы"]
+        ThresholdExplain["Пороги: 0.9 → блокировка, 0.7–0.9 → занижение λ_t"]
+        DriftExplain["Защита от дрейфа: сброс тренда при смене темы<br/>JS-дивергенция → принудительный Сон"]
+        FailoverExplain["Защита от сбоев: NaN → threat = 0.1"]
+        LambdaExplain["Агрегация: (surprise × bond) / threat<br/>Модуляция: орексин, серотонин, окситоцин, AP"]
+    end
+```
 
 ---
 
