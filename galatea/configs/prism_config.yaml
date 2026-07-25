@@ -1,0 +1,32 @@
+# Конфигурация Призм Galatea
+
+surprise_prism:
+  mode: "mvp"                       # "mvp" или "full"
+  tau: 0.1                          # температура для сигмоиды
+  topic_threshold: 0.7              # порог смены темы (cosine distance)
+  timeout_minutes: 5.0              # пауза, после которой surprise = 0.5
+  # Параметры полной версии (если mode=full)
+  hidden_size: 256                  # размер скрытого слоя f_pred
+  lr_pred: 0.0001                   # learning rate для f_pred
+  epsilon_explore: 0.02             # вероятность ε-жадного исследования
+  lambda_var: 0.01                  # коэффициент штрафа за дисперсию
+
+bond_prism:
+  hidden_size: 128                  # размер скрытого состояния GRU
+  lr_bp: 0.00001                    # learning rate для обучения BP
+  decay_after_seconds: 3600         # время затухания (1 час)
+  decay_factor: 0.9                 # коэффициент затухания
+  initial_bond: 0.2                 # начальный bond для нового пользователя
+  cold_start_steps: 20              # количество шагов ускоренного старта
+  cold_start_coef: 1.5              # коэффициент ускорения роста
+  skepticism_threshold: 0.5         # порог взлёта bond за сессию
+  repeat_cos_threshold: 0.95        # порог сходства состояний для детектора повторов
+  repeat_count: 3                   # сколько раз подряд сходство > порога
+  repeat_window: 20                 # окно для проверки повторов
+  diversity_window: 50              # окно для учёта разнообразия (дисперсия surprise)
+
+threat_prism:
+  fast_mlp_hidden: 32               # размер скрытого слоя быстрого MLP
+  full_mlp_hidden: 32               # размер скрытого слоя полного MLP (с ΔH)
+  threat_boost_duration: 5          # длительность буста (минут)
+  ethics_threshold: 0.7             # порог срабатывания этического классификатора

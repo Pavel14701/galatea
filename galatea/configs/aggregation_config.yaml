@@ -1,0 +1,32 @@
+# Конфигурация агрегатора λ_t
+
+aggregator:
+  epsilon: 0.01                     # защита от деления на ноль
+  lambda_max_base_min: 4.0          # минимальный λ_max (при serotonin=0)
+  lambda_max_base_max: 6.0          # максимальный λ_max (при serotonin=1)
+  oxytocin_effect: 0.05             # насколько окситоцин снижает threat
+  min_threat_after_oxytocin: 0.05   # минимальный threat после влияния окситоцина
+
+  # Пороги адреналина (AP)
+  ap_surprise_threshold: 0.9        # для обычных пользователей
+  ap_bond_threshold: 0.8
+  ap_threat_threshold: 0.5
+  ap_lambda_max: 10.0               # максимум λ_t при AP
+  ap_multiplier: 2.0                # коэффициент умножения при AP
+
+  # Пороги для молодых пользователей (более строгие)
+  young_ap_surprise_threshold: 0.95
+  young_ap_bond_threshold: 0.85
+  young_ap_threat_threshold: 0.4
+
+  # Лимиты адреналина
+  max_ap_per_user_cycles: 10        # максимум AP на пользователя за 10 циклов
+  max_ap_per_global_cycle: 3        # максимум AP глобально за цикл
+
+  # Параметры гормонов (используются в агрегации)
+  # Эти значения передаются извне, но здесь заданы для справки
+  hormone_defaults:
+    serotonin: 0.5
+    orexin: 0.5
+    oxytocin: 0.3
+    cortisol: 0.2
