@@ -63,7 +63,7 @@ flowchart TD
     end
 
     subgraph TimeCheck["Проверка таймстемпа"]
-        TimeCheckNode{Пауза > 5 минут?}
+        TimeCheckNode{"Пауза > 5 минут?"}
         TimeSet["surprise_score = 0.5<br/>(нейтральное значение)"]
     end
 
@@ -83,7 +83,7 @@ flowchart TD
     end
 
     subgraph Filters["Фильтры"]
-        TopicFilter{Смена темы?<br/>cosine_distance(e_actual, e_prev) > 0.7}
+        TopicFilter{"Смена темы?<br/>cosine_distance(e_actual, e_prev) > 0.7"}
         TopicApply["surprise_score × 0.3"]
     end
 
@@ -100,10 +100,10 @@ flowchart TD
 
     subgraph Protection["Защита от самоусиливающейся предсказуемости"]
         Monitor["Мониторинг:<br/>средний surprise_score<br/>за последние 200 шагов"]
-        CheckLow{средний surprise < 0.3?}
+        CheckLow{"средний surprise < 0.3?"}
         Epsilon["ε-жадное исследование:<br/>2% шанс → surprise = 0.8"]
         Variance["Штраф за низкую дисперсию:<br/>L_total = MSE + λ_var × max(0, 0.1 - σ²(e_pred))"]
-        Restore{средний surprise > 0.4?}
+        Restore{"средний surprise > 0.4?"}
         Disable["Отключить механизмы"]
     end
 
@@ -267,10 +267,9 @@ flowchart TD
 
     subgraph Dynamics["Динамика состояния"]
         subgraph Decay["Временное затухание"]
-            CheckDecay{last_active > 1 час?}
+            CheckDecay{"last_active > 1 час?"}
             DecayApply["s_t × 0.9"]
         end
-
         subgraph ColdStart["Холодный старт"]
             Init["Новый пользователь: bond_score = 0.2"]
             Accelerate{"Первые 20 шагов?<br/>surprise > 0.6?<br/>threat < 0.4?<br/>Нет повторов?"}
@@ -280,24 +279,22 @@ flowchart TD
 
     subgraph Protections["Защита от манипуляций"]
         subgraph Skepticism["Режим скепсиса"]
-            CheckSkeptic{Взлёт bond_score > 0.5 за сессию?}
+            CheckSkeptic{"Взлёт bond_score > 0.5 за сессию?"}
             SkepticAction["bond_score × 0.5<br/>threat_boost +0.2 (10 шагов)<br/>Защита адаптера отложена"]
         end
-
         subgraph Repeats["Детектор повторов"]
-            CheckRepeat{cos_sim(s_t, s_{t-20}) > 0.95<br/>3 раза подряд?}
+            CheckRepeat{"cos_sim(s_t, s_{t-20}) > 0.95<br/>3 раза подряд?"}
             RepeatAction["bond_score × 0.7 (занижение на 30%)"]
         end
-
         subgraph Diversity["Учёт разнообразия"]
-            CheckDiversity{Низкая дисперсия surprise_score?}
+            CheckDiversity{"Низкая дисперсия surprise_score?"}
             DiversityAction["Замедление роста bond_score"]
         end
     end
 
     subgraph Reconciliation["Фаза примирения"]
-        CheckFall{Падение bond_score ≥ 0.3<br/>из-за угрозы?}
-        CheckSeries{Серия шагов:<br/>threat < 0.3?<br/>surprise > 0.5?}
+        CheckFall{"Падение bond_score ≥ 0.3<br/>из-за угрозы?"}
+        CheckSeries{"Серия шагов:<br/>threat < 0.3?<br/>surprise > 0.5?"}
         Boost["Буст +0.05 за шаг<br/>(до уровня до падения)"]
     end
 
@@ -306,7 +303,6 @@ flowchart TD
             SQLite["SQLite (сериализация в BLOB)"]
             Lock["threading.Lock"]
         end
-
         subgraph Stage2["Этап 2+ (Продакшен)"]
             Redis["Redis Cluster<br/>user:{user_id} → bond_state"]
             Version["Версионирование"]
@@ -325,39 +321,56 @@ flowchart TD
         Batch["Микробатчи из 8 шагов"]
     end
 
-    Inputs --> Architecture
-    State --> Dynamics
-    Decay --> State
-    ColdStart --> BondScore
-    BondScore --> Protections
-    Protections --> Reconciliation
-    Reconciliation --> Storage
-    Storage --> Output
+    %% Исправленные связи
+    EUser --> GRU
+    EResponse --> GRU
+    Timestamp --> GRU
+    LastActive --> CheckDecay
+    GRU --> State
+    State --> BondScore
+    BondScore --> Sigmoid
+    Sigmoid --> Final
 
-    Decay --> StateUpdate
-    ColdStart --> StateUpdate
-    Protections --> StateUpdate
-    Reconciliation --> StateUpdate
+    State --> CheckDecay
+    CheckDecay -->|Да| DecayApply
+    DecayApply --> State
 
-    State --> Training
-    Training --> Targets
-    Training --> LR
-    Training --> Batch
+    Init --> Accelerate
+    Accelerate -->|Да| AccelerateApply
+    AccelerateApply --> BondScore
 
-    subgraph Explanations["Пояснения"]
-        GRUExplain["GRU (128): Рекуррентная модель, аккумулирующая историю отношений"]
-        MLPExplain["MLP: Нелинейное отображение состояния в оценку близости"]
-        DecayExplain["Временное затухание: 0.9 при паузе > 1ч — мягкое остывание"]
-        ColdExplain["Холодный старт: 0.2 + ускорение (×1.5) при благоприятных условиях"]
-        SkepticExplain["Режим скепсиса: защита от быстрых атак на bond_score"]
-        RepeatExplain["Детектор повторов: штраф за механическое повторение"]
-        DiversityExplain["Учёт разнообразия: замедление роста при однообразном диалоге"]
-        ReconciliationExplain["Фаза примирения: восстановление после конфликта (+0.05/шаг)"]
-        Stage1Explain["Этап 1: локальное хранение, блокировка threading.Lock"]
-        Stage2Explain["Этап 2+: Redis с версионированием и атомарными транзакциями"]
-    end
-```
+    BondScore --> CheckSkeptic
+    CheckSkeptic -->|Да| SkepticAction
+    SkepticAction --> BondScore
 
+    State --> CheckRepeat
+    CheckRepeat -->|Да| RepeatAction
+    RepeatAction --> BondScore
+
+    BondScore --> CheckDiversity
+    CheckDiversity -->|Да| DiversityAction
+    DiversityAction --> BondScore
+
+    BondScore --> CheckFall
+    CheckFall -->|Да| CheckSeries
+    CheckSeries -->|Да| Boost
+    Boost --> BondScore
+
+    BondScore --> Final
+    State --> StateUpdate
+
+    State --> SQLite
+    SQLite --> Lock
+    Lock --> StateUpdate
+
+    State --> Redis
+    Redis --> Version
+    Version --> Watch
+    Watch --> StateUpdate
+
+    State --> Targets
+    State --> LR
+    State --> Batch
 ---
 
 ## 3. Призма Угрозы (Threat Prism, TP)
