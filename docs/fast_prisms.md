@@ -371,6 +371,8 @@ flowchart TD
     State --> Targets
     State --> LR
     State --> Batch
+```
+
 ---
 
 ## 3. Призма Угрозы (Threat Prism, TP)
