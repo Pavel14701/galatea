@@ -1,8 +1,10 @@
-import unittest
-import torch
 import time
-from galatea.prisms import BondPrism
+import unittest
+
+import torch
+
 from galatea.model_interfaces import ModelInterface
+from galatea.prisms import BondPrism
 
 
 class MockModelForBond(ModelInterface):
@@ -13,17 +15,18 @@ class MockModelForBond(ModelInterface):
         # Для воспроизводимости используем хеш
         import hashlib
         h = hashlib.md5(text.encode()).hexdigest()
-        vec = [int(h[i:i+2], 16) / 255.0 for i in range(0, min(16, len(h)), 2)]
+        vec = [int(h[i:i + 2], 16) / 255.0 for i in range(0, min(16, len(h)), 2)]
         vec += [0.0] * (self.embed_dim - len(vec))
         return torch.tensor(vec[:self.embed_dim], dtype=torch.float32)
 
     def get_embed_dim(self):
         return self.embed_dim
+
     # Заглушки остальных методов
     def get_embeddings(self, input_ids): pass
     def get_hidden_state(self, input_ids, layer_idx): pass
     def get_logits(self, input_ids): pass
-    def tokenize(self, text): return torch.randint(0, 100, (1,5))
+    def tokenize(self, text): return torch.randint(0, 100, (1, 5))
     def get_hidden_dim(self): return self.embed_dim
     def get_vocab_size(self): return 1000
 
@@ -49,7 +52,7 @@ class TestBondPrism(unittest.TestCase):
     def test_initial_bond(self):
         """Первый вызов возвращает bond ~0.2 (с учётом холодного старта)."""
         # Первый шаг: state инициализируется, bond = 0.2
-        bond = self.bp.forward("user1", "resp1", timestamp=time.time(), surprise=0.5, threat=0.2)
+        bond = self.bp.forward('user1', 'resp1', timestamp=time.time(), surprise=0.5, threat=0.2)
         self.assertAlmostEqual(bond, 0.2, delta=0.1)  # может немного отличаться из-за MLP
 
     def test_bond_grows(self):
@@ -57,7 +60,7 @@ class TestBondPrism(unittest.TestCase):
         # Делаем несколько шагов с высоким surprise и низкой threat
         t = time.time()
         for i in range(3):
-            bond = self.bp.forward(f"user{i}", f"resp{i}", timestamp=t+i*10,
+            bond = self.bp.forward(f'user{i}', f'resp{i}', timestamp=t + i * 10,
                                    surprise=0.7, threat=0.2)
         # После нескольких шагов bond должен быть > 0.2
         self.assertGreater(bond, 0.25)
@@ -69,7 +72,7 @@ class TestBondPrism(unittest.TestCase):
         t = time.time()
         bonds = []
         for i in range(5):
-            b = self.bp.forward(f"u{i}", f"r{i}", timestamp=t+i*10,
+            b = self.bp.forward(f'u{i}', f'r{i}', timestamp=t + i * 10,
                                 surprise=0.7, threat=0.2)
             bonds.append(b)
         # bond должен расти быстрее, чем без ускорения (но мы не можем точно проверить,
@@ -82,7 +85,7 @@ class TestBondPrism(unittest.TestCase):
         t = time.time()
         # Имитируем быстрый рост
         # Первый шаг – базовый
-        b1 = self.bp.forward("u1", "r1", timestamp=t, surprise=0.9, threat=0.1)
+        b1 = self.bp.forward('u1', 'r1', timestamp=t, surprise=0.9, threat=0.1)
         # Второй шаг – очень высокий bond (искусственно)
         # В реальности bond не может так резко вырасти, но для теста мы форсируем?
         # В защите скепсис срабатывает при взлёте >0.5 за сессию.
@@ -125,12 +128,12 @@ class TestBondPrism(unittest.TestCase):
         """Этическое нарушение снижает bond на 0.3."""
         self.bp.reset()
         self.bp.state = torch.zeros(1, 1, 16)  # инициализируем
-        bond = self.bp.forward("u", "r", timestamp=time.time(), surprise=0.5, threat=0.2)
+        bond = self.bp.forward('u', 'r', timestamp=time.time(), surprise=0.5, threat=0.2)
         # Устанавливаем флаг нарушения
         self.bp.set_ethics_violation()
-        new_bond = self.bp.forward("u2", "r2", timestamp=time.time()+10, surprise=0.5, threat=0.2)
+        new_bond = self.bp.forward('u2', 'r2', timestamp=time.time() + 10, surprise=0.5, threat=0.2)
         self.assertAlmostEqual(new_bond, max(0.0, bond - 0.3), delta=0.05)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

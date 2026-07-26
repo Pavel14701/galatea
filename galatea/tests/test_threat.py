@@ -1,8 +1,9 @@
 import unittest
+
 import torch
-import numpy as np
-from galatea.prisms import ThreatPrism
+
 from galatea.model_interfaces import ModelInterface
+from galatea.prisms import ThreatPrism
 
 
 class MockModelForThreat(ModelInterface):
@@ -51,27 +52,27 @@ class TestThreatPrism(unittest.TestCase):
 
     def test_fast_evaluation(self):
         """Быстрая оценка возвращает значение в [0,1]."""
-        input_ids = torch.randint(0, 100, (1,5))
-        threat = self.tp.forward(input_ids, "user", "resp", surprise=0.5, bond=0.3)
+        input_ids = torch.randint(0, 100, (1, 5))
+        threat = self.tp.forward(input_ids, 'user', 'resp', surprise=0.5, bond=0.3)
         self.assertGreaterEqual(threat, 0.0)
         self.assertLessEqual(threat, 1.0)
 
     def test_ethics_violation(self):
         """Этическое нарушение устанавливает threat = 0.9."""
         self.tp.set_ethics_violation()
-        input_ids = torch.randint(0, 100, (1,5))
-        threat = self.tp.forward(input_ids, "user", "resp", surprise=0.5, bond=0.3)
+        input_ids = torch.randint(0, 100, (1, 5))
+        threat = self.tp.forward(input_ids, 'user', 'resp', surprise=0.5, bond=0.3)
         self.assertAlmostEqual(threat, 0.9, places=3)
         # После одного вызова флаг сбрасывается
-        threat2 = self.tp.forward(input_ids, "user", "resp", surprise=0.5, bond=0.3)
+        threat2 = self.tp.forward(input_ids, 'user', 'resp', surprise=0.5, bond=0.3)
         self.assertNotAlmostEqual(threat2, 0.9, places=3)
 
     def test_boost(self):
         """Буст активен после нарушения и увеличивает threat."""
         self.tp.set_ethics_violation()  # включает буст
-        input_ids = torch.randint(0, 100, (1,5))
+        input_ids = torch.randint(0, 100, (1, 5))
         # До буста threat был бы около 0.5, после буста должен быть >0.5
-        threat = self.tp.forward(input_ids, "user", "resp", surprise=0.5, bond=0.3)
+        threat = self.tp.forward(input_ids, 'user', 'resp', surprise=0.5, bond=0.3)
         self.assertGreater(threat, 0.5)
 
     def test_boost_ticks(self):
@@ -84,10 +85,10 @@ class TestThreatPrism(unittest.TestCase):
 
     def test_full_evaluation(self):
         """Полная оценка (с ΔH) вызывается только для кандидатов."""
-        input_ids = torch.randint(0, 100, (1,5))
+        input_ids = torch.randint(0, 100, (1, 5))
         # Событие-кандидат: surprise*bond > 0.5
         threat = self.tp.forward(
-            input_ids, "user", "resp",
+            input_ids, 'user', 'resp',
             surprise=0.8, bond=0.7,
             adapter_copy=torch.nn.Linear(10, 10),  # заглушка
             gradient_step={'params': []}           # заглушка
@@ -104,5 +105,5 @@ class TestThreatPrism(unittest.TestCase):
         pass
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()
